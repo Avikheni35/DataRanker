@@ -37,29 +37,33 @@ Two services over HTTP. Product name in the UI is **Matrix**.
 
 Routes (in `client/src/App.js`):
 ```
-/                      LandingPage (public, product-led)
+/                      LandingPage (public)
 /pricing               PricingPage (public; tiers from GET /plans)
 /about                 AboutPage (public)
-/login, /signup        Login/Signup (public; real JWT auth)
-/forgot-password       ForgotPasswordPage
+/login, /signup        Auth pages (JWT)
+/forgot-password       ForgotPasswordPage (OTP-based reset)
 /app                   ProtectedRoute + AppShell wrap all routes below
-/app/                  Dashboard.js — the pipeline page
-/app/column-mapper     → redirects to /app (mapping is now inline on the pipeline page)
-/app/results           StockDashboard
-/app/kpi-editor        KPILibraryEditor (always accessible)
-/app/screener          ScreenerPage — admin uploads daily snapshot; users filter and run pipeline
+/app/                  Dashboard — upload + inline column mapper + pipeline runner
+/app/column-mapper     → redirects to /app
+/app/results           StockDashboard (results viewer + radar chart)
+/app/kpi-editor        KPILibraryEditor (GET/PUT /kpi-library)
+/app/screener          ScreenerPage — admin uploads daily snapshot; users filter & run pipeline
 /app/comparison        ComparisonPage — pick 2–6 companies from screener data, analytical dashboard
-/app/settings          SettingsPage
-/app/account           AccountPage
+/app/settings          SettingsPage (admin only — controls AppSettings feature flags)
+/app/account           AccountPage (OTP-based password/email change)
 /app/admin/users       AdminUsersPage (admin only)
-/app/company/:symbol   CompanyDetailPage — real-time quote, fundamentals, OHLCV chart (Yahoo Finance); opened from StockDashboard company drawer
+/app/admin/logs        AdminLogsPage — merged payment + admin-action audit log (admin only)
+/app/admin/plans       AdminPlansPage — admin CRUD for Plan documents (pricing tiers, trial config)
+/app/company/:symbol   CompanyDetailPage — real-time quote, fundamentals, OHLCV chart (Yahoo Finance)
+/app/premium           PremiumPage — feature showcase / upgrade info for non-premium users
+/app/upgrade           UpgradePage — upgrade prompt for expired trial or limited-plan users
 *                      NotFoundPage (real 404)
 ```
 
 Key files:
-- `src/api.js` — `API_BASE` from `REACT_APP_API_URL` + `apiFetch` helper (always sends `credentials:'include'` so the auth cookie travels)
+- `src/api.js` — `API_BASE` from `REACT_APP_API_URL`; `apiFetch` sends both `credentials:'include'` (cookie) and `Authorization: Bearer <matrix_token>` from localStorage (dual auth for cross-domain support)
 - `src/seo.js` — per-route `<title>`/`<meta>`/`<link>` components; React 19 hoists them into `<head>` automatically
-- `src/auth.js` — real auth: `signUp`/`logIn`/`logOut`/`fetchMe` against `/auth/*`; caches the user object in `localStorage` (the JWT itself is an httpOnly cookie, not readable in JS)
+- `src/auth.js` — `signUp/logIn/logOut/fetchMe`; JWT stored as both httpOnly cookie and in `localStorage` under key `matrix_token`
 - `src/AppConfigContext.js` — React context for app-wide feature flags; `App.js` fetches `GET /app-config` after auth and stores result here; components consume it via `useContext(AppConfigContext)`
 - `src/App.js` — root router; seeds `backendConfig` from `GET /column-mapping`; lifts `outputFile`, `COLUMN_MAPPING`, and the single pipeline upload file (query export)
 - `src/Dashboard.js` — pipeline page; POSTs the query export + `mapping_json` to `/run-pipeline`, gets the ranked XLSX back. Neither the KPI library nor the industry-mapping workbook is uploaded — KPIs come from the user's saved set in the DB, and the mapping workbook is bundled with the backend
@@ -77,10 +81,13 @@ Key files:
 - `pages/ComparisonPage.jsx` — Company comparison dashboard. Sections: radar (20–100 normalized, top 8 CV metrics), leaderboard (composite rank by metric wins), multi-metric grouped bar (0–100 normalized per metric, toggle chips), single-metric bar, scatter plot (X/Y metric dropdowns, custom dot labels), percentile horizontal bars vs full dataset, raw data table. Radar uses `undefined` (not 0) for missing values so Recharts skips those spokes. Metric selection via `sortByCV` (coefficient of variation). `PALETTE` = 6 colors, `MAX_COMPANIES` = 6.
 - `src/StockDashboard.jsx` — Results viewer; parses ranked XLSX from IndexedDB, shows per-template company table with **pagination** (25/50/100/200, default 50), **ordered columns** (Identifiers → Template KPIs → Other data, via `partitionKpiKeys`), column picker with three labelled sections, sort by rank/score/any KPI, search by symbol/name, company drawer with bar chart + radar overlay vs template average. `IDENTIFIER_COLS` (currently `BSE Code`, `ISIN Code`, `NSE Code`) controls which columns are pinned as identifiers — extend this set to add more.
 - `components/ProtectedRoute.jsx` — verifies the session via `GET /auth/me`, else redirects to `/login`
-- `components/AppShell.jsx` — app sidebar/topbar; NAV includes Pipeline, Screener, Results, KPI Editor
+- `components/AppShell.jsx` — app sidebar/topbar
 - `components/MarketingNav.jsx` / `MarketingFooter.jsx` — shared chrome for the public pages
 - `components/Toast.jsx` — app-wide notification banner; triggered via the `notify` callback lifted in `App.js`
 - `components/ThemeToggle.jsx` + `theme/ThemeContext.jsx` — light/dark mode, persisted to `localStorage`, applied via `<html data-theme>`
+- `components/PlanGate.jsx` — gates premium-only UI; reads user `plan` from auth context
+- `components/GoogleButton.jsx` — triggers Google One Tap / OAuth (needs `REACT_APP_GOOGLE_CLIENT_ID`)
+- `components/PaymentButton.jsx` — Razorpay payment trigger; lazy-loads `checkout.js` on first click, calls `POST /payment/create-order` then `POST /payment/verify`; calls `onSuccess(updatedUser)` on completion
 - `theme/index.js` — **design-system tokens as CSS variables** (`var(--x)`); concrete light/dark values live in `index.css`. Flipping `data-theme` re-themes the whole app. Brand (`#7C6CFF→#4F46E5`) + semantic colors are shared by both modes. `StockDashboard.jsx` and `KPILibraryEditor.js` still have some hardcoded hex inline — convert to `var(--…)` if you need them fully theme-reactive.
 - `index.css` — font imports, the `:root[data-theme=...]` token palettes, and the global ambient backdrop
 
@@ -90,20 +97,35 @@ Deployment plumbing: `client/vercel.json` + `client/public/_redirects` provide t
 
 - `server.js` — loads env, connects MongoDB (`config/db.js`), credentialed CORS (`CLIENT_ORIGIN`), mounts routers; `express.json` limit is **10 MB** (raised from default for `/screener/run-pipeline` JSON body)
 - `config/db.js` — Mongoose connection helper; called once at startup
-- `routes/auth.js` + `controllers/authController.js` — `POST /auth/signup|login|logout`, `GET /auth/me`. Sets/clears the httpOnly JWT cookie via `middleware/auth.js`
-- `middleware/auth.js` — `signToken`, cookie helpers, `requireAuth` (guards most app routes), and `requireAdmin` (chains after `requireAuth`; checks `req.user.isAdmin`)
-- `models/User.js` — `{ name, email, passwordHash, plan, isAdmin }`; bcrypt hashing; `plan` defaults to `free`, `isAdmin` defaults to `false`. `toSafeJSON()` exposes `isAdmin` to the frontend.
-- `models/KpiLibrary.js` — per-user Tier 1 KPI library `{ userId (unique), name, rows:[{template,kpi,category,weight,direction}] }`; replaces the uploaded KPI Excel
-- `models/ScreenerSnapshot.js` — singleton document (deleteMany+create on each admin upload): `{ uploadedAt, uploadedBy, fileName, filePath, rawMimeType, columns:[String], rows:[Mixed] }`. The original file is stored on **server disk** at `server/uploads/screener-snapshot.<ext>`; `filePath` is the absolute path. Download endpoint streams it via `fs.createReadStream`. Old file is deleted from disk before each replacement.
-- `routes/plans.js` + `core/plans.js` — `GET /plans`; tiers **Free / Premium / Enterprise** (only Free active)
-- `routes/kpiLibrary.js` + `services/kpiLibrary.js` — `GET /kpi-library` (lazy-seeds defaults from `core/kpiDefaults.js`) and `PUT /kpi-library` (validated save). `toRankerRows` adapts stored rows into the keys the ranker reads
+- `middleware/auth.js` — `signToken`, cookie helpers, `requireAuth` (checks `Authorization: Bearer` header first, then httpOnly cookie), `requireAdmin`, `requirePremium`
+- `routes/auth.js` + `controllers/authController.js` — all auth endpoints (rate-limited):
+  - `POST /auth/signup|login|logout`, `GET /auth/me`
+  - `POST /auth/google` — validates Google `accessToken` via Google Identity Services, upserts user by `googleId`
+  - `POST /auth/verify-email`, `POST /auth/resend-verification`, `POST /auth/forgot-password`, `POST /auth/reset-password`, `POST /auth/request-otp`, `POST /auth/change-password`, `PUT /auth/profile` — OTP-based flows
+- `models/User.js` — `{ name, email, passwordHash, googleId, plan, isAdmin, emailVerified, trialEndsAt, paidUntil, planOverrideFree }`; default `plan` is `"standard"` (not `"free"`); **`trialEndsAt`** is set once at signup (90 days), never extended; **`paidUntil`** is null until payment, then set/extended by `POST /payment/verify`; `planOverrideFree` lets admins grant permanent free access; `toSafeJSON()` exposes `isAdmin`, `emailVerified`, `hasPassword`, `trialEndsAt`, `paidUntil`, `planOverrideFree`, and `createdAt`
+- `models/Payment.js` — `{ userId, razorpayOrderId, razorpayPaymentId (unique), plan, period, amount (paise), currency }`; unique index on `razorpayPaymentId` guards against replay attacks
+- `models/AdminLog.js` — `{ actorId, actorEmail, targetId, targetEmail, targetName, action, changes: { field, from, to } }`; written by `routes/adminUsers.js` on each plan/date change
+- `models/KpiLibrary.js` — per-user Tier 1 KPI library `{ userId (unique), rows:[{template,kpi,category,weight,direction}] }`
+- `models/ScreenerSnapshot.js` — singleton (deleteMany + create on each admin upload); file stored at `server/uploads/screener-snapshot.<ext>` on disk (gitignored)
+- `models/AppSettings.js` — singleton (`getOrCreate()` static); feature flags: `allowCustomUpload`, `screenerEnabled`, `comparisonEnabled`, `kpiEditorLocked`, `screenerMaxRows`, `maintenanceBanner`
+- `models/OtpToken.js` — short-lived OTP; SHA-256 hashed, 10-minute TTL enforced by MongoDB TTL index; `OtpToken.generate(email, purpose)` / `OtpToken.verify(email, otp, purpose)` are the only public API
+- `models/Plan.js` — admin-managed subscription plans; fields include `planId`, `monthlyPrice`, `monthlyDiscountedPrice`, `yearlyPrice`, `yearlyDiscountedPrice`, `yearlyDiscountPct`, `trialDays`, `isActive`, `highlighted`, `cta`, `order`; discount fields override regular price in payment flow when > 0
+- `routes/plans.js` — `GET /plans` (public); reads active `Plan` documents from MongoDB sorted by `order`, falls back to hardcoded defaults in `core/plans.js` when no documents exist
+- `routes/adminPlans.js` — `GET/POST/PUT/DELETE /admin/plans` (all `requireAdmin`); full CRUD for Plan documents
+- `routes/adminSettings.js` — `GET /app-config` (auth-gated, any user), `GET/PUT /admin/settings` (admin)
+- `routes/adminUsers.js` — `GET /admin/users`, `PATCH /admin/users/:id`, `DELETE /admin/users/:id`; writes `AdminLog` on each change; cannot modify/delete self
+- `routes/payment.js` — Razorpay integration: `POST /payment/create-order` (uses active Plan price or fallback ₹499/mo, ₹4999/yr), `POST /payment/verify` (HMAC-SHA256 check, writes Payment, extends `user.paidUntil`); both return 503 when Razorpay keys not configured
+- `routes/adminLogs.js` — `GET /admin/logs` (requireAdmin); merged Payment records + AdminLog records sorted newest-first
+- `routes/kpiLibrary.js` — `GET /kpi-library` (lazy-seeds defaults from `core/kpiDefaults.js`), `PUT /kpi-library` (validated save)
 - `routes/pipeline.js` — `GET /column-mapping` (public) and `POST /run-pipeline` (auth-gated, single `query_results` upload, 15 MB limit); validates `mapping_json` presence and JSON array shape before parsing (returns clean 400 on failure)
 - `routes/screener.js` — 4 endpoints (all auth-gated):
   - `POST /admin/screener` (+ `requireAdmin`) — multer upload (25 MB max), parses CSV/XLSX, deletes old `server/uploads/` file, writes new file to disk, stores singleton `ScreenerSnapshot`
   - `GET /screener` — returns `{ columns, rows, uploadedAt, fileName }` (no raw file data)
   - `GET /screener/download` — streams original file via `fs.createReadStream(snap.filePath)`
   - `POST /screener/run-pipeline` — accepts `{ rows }` JSON body, auto-maps columns via `COLUMN_MAPPING` aliases, runs the full 3-stage pipeline, returns ranked XLSX
-- `scripts/makeAdmin.js` — one-time CLI: `node scripts/makeAdmin.js <email>` sets `isAdmin: true`. Run from `server/` directory with a valid `.env`.
+- `scripts/makeAdmin.js` — CLI: `node scripts/makeAdmin.js <email>`. Run from `server/` with valid `.env`.
+- `scripts/seedPlans.js` — upserts Standard and Premium Plan documents into MongoDB. Safe to re-run: `node scripts/seedPlans.js`.
+- `scripts/migratePaidUntil.js` — one-time backfill: reconstructs `paidUntil` from Payment records for users who paid before the `trialEndsAt`→`paidUntil` field split. Safe to re-run.
 - `services/industryMapping.js` — loads + caches the bundled `server/data/industry-mapping.xlsx` (the canonical 190→130 mapping) and hands its buffer to the mapper. Replaces the per-run mapping upload; keeps the proprietary mapping server-side only
 - `services/formatter.js`, `services/mapper.js`, `services/ranker.js` + `lib/rank.js`, `lib/io.js` — the **ported pipeline** (Stage 1 format → Stage 2 industry map → Stage 3 direction-aware percentile ranking). Protected core logic. `runRanking(mapped, kpiRows)` takes parsed rows; `runRankingFromBuffer` keeps the legacy xlsx path (scoring math unchanged)
 - `core/config.js` — `COLUMN_MAPPING` (served to the frontend; each value is an **array of accepted source-column aliases**), `EXTRA_COLUMNS`, drop columns, KPI sheet coordinates, output cell colors
